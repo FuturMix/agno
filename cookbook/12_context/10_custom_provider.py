@@ -15,10 +15,14 @@ Requires: OPENAI_API_KEY
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 from agno.agent import Agent
 from agno.context import Answer, ContextProvider, Status
 from agno.models.openai import OpenAIResponses
+
+if TYPE_CHECKING:
+    from agno.run import RunContext
 
 # ---------------------------------------------------------------------------
 # The data
@@ -40,12 +44,18 @@ class FAQContextProvider(ContextProvider):
     async def astatus(self) -> Status:
         return self.status()
 
-    def query(self, question: str) -> Answer:
+    # Accept (and ignore, for this simple source) the framework's
+    # `run_context` kwarg. Real providers use it to thread the caller's
+    # user_id / session_id / metadata into a sub-agent for per-user
+    # scoping. See SlackContextProvider for a working example.
+    def query(self, question: str, *, run_context: RunContext | None = None) -> Answer:
         key = next((k for k in FAQ if k in question.lower()), None)
         return Answer(text=FAQ[key] if key else "No FAQ entry matches that.")
 
-    async def aquery(self, question: str) -> Answer:
-        return self.query(question)
+    async def aquery(
+        self, question: str, *, run_context: RunContext | None = None
+    ) -> Answer:
+        return self.query(question, run_context=run_context)
 
 
 # ---------------------------------------------------------------------------
