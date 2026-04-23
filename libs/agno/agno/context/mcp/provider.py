@@ -101,15 +101,26 @@ class MCPContextProvider(ContextProvider):
         Does NOT attempt a fresh connect because ``_ensure_session`` is
         async. Callers that need a live probe should use ``astatus``.
         """
-        if self._tools is not None and getattr(self._tools, "initialized", False):
+        if self._tools is not None and getattr(self._tools, "initialized", False) and self._tool_descriptions:
             return Status(ok=True, detail=self._detail_ok())
-        return Status(ok=True, detail=f"mcp: {self.server_name} (not yet connected)")
+        return Status(ok=False, detail=f"mcp: {self.server_name} (not yet connected)")
 
     async def astatus(self) -> Status:
         try:
             await self._ensure_session()
         except Exception as exc:
             return Status(ok=False, detail=f"mcp {self.server_name}: {type(exc).__name__}: {exc}")
+        # Connection didn't raise but the server gave us zero tools.
+        # Most common cause: the command started and exited without
+        # completing the MCP handshake (e.g. wrong interpreter, subprocess
+        # crashed during init). ``_tools.close()`` would still succeed,
+        # so we report the dead-session state honestly instead of
+        # claiming ok=True with "(0 tools)".
+        if not self._tool_descriptions:
+            return Status(
+                ok=False,
+                detail=f"mcp {self.server_name}: connected but exposes no tools (server init failed?)",
+            )
         return Status(ok=True, detail=self._detail_ok())
 
     def query(self, question: str, *, run_context: RunContext | None = None) -> Answer:
@@ -132,11 +143,20 @@ class MCPContextProvider(ContextProvider):
         them (lifespan-task ownership avoids "cancel scope in a
         different task" errors on ``aclose``).
 
+        Uses ``asyncio.timeout()`` (context manager) rather than
+        ``asyncio.wait_for()`` (which wraps in an inner Task). The
+        ``mcp`` SDK's ``stdio_client`` is an async generator tracked by
+        anyio per task, so entering its context inside a wait_for task
+        and exiting it on the caller's task raises "Attempted to exit
+        cancel scope in a different task than it was entered in".
+        Keeping setup on the caller's task avoids that.
+
         On timeout or error: logs a warning and clears partial state.
         The provider retries on the next call.
         """
         try:
-            await asyncio.wait_for(self._ensure_session(), timeout=self.timeout_seconds)
+            async with asyncio.timeout(self.timeout_seconds):
+                await self._ensure_session()
         except Exception as exc:
             self._tools = None
             self._tool_descriptions = []
@@ -252,13 +272,40 @@ class MCPContextProvider(ContextProvider):
         try:
             await self._tools._connect()
         except Exception:
-            # Reset so the next attempt gets a fresh toolkit — a failed
-            # connect can leave MCPTools in a partially-initialized state.
-            self._tools = None
-            self._tool_descriptions = []
+            await self._discard_tools()
             raise
+        # MCPTools.initialize() catches (RuntimeError, BaseException) and
+        # only logs — it doesn't re-raise. So _connect() can return
+        # "successfully" with stdio_client entered, ClientSession entered,
+        # and `_initialized=False` (e.g. subprocess exited mid-handshake).
+        # Detect that here, drain the leaked contexts, and raise so the
+        # caller reports setup failure instead of silently serving zero
+        # tools.
+        if not getattr(self._tools, "_initialized", False):
+            await self._discard_tools()
+            raise RuntimeError(
+                f"MCPContextProvider[{self.id}]: _connect() returned without "
+                "raising but the MCP session never completed initialization "
+                "(subprocess likely exited before the MCP handshake)."
+            )
         self._tool_descriptions = _describe_tools(self._tools)
         return self._tools
+
+    async def _discard_tools(self) -> None:
+        """Drop the current tools instance, draining entered contexts first.
+
+        ``MCPTools.close()`` early-returns when ``_initialized=False``,
+        which is exactly the case when ``_connect()`` half-succeeded
+        (e.g. stdio_client entered but subprocess died before handshake).
+        Without draining, the ``stdio_client`` async generator leaks to
+        the GC and emits "cancel scope in a different task" at
+        interpreter shutdown because the GC runs its __aexit__ on the
+        wrong task.
+        """
+        doomed = self._tools
+        self._tools = None
+        self._tool_descriptions = []
+        await _drain_active_contexts(doomed)
 
     async def _aensure_agent(self) -> Agent:
         """Lazy-build the sub-agent AFTER the MCP session is connected
@@ -296,6 +343,44 @@ class MCPContextProvider(ContextProvider):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+async def _drain_active_contexts(tools: MCPTools | None) -> None:
+    """Close entered contexts on the caller's task.
+
+    Called when a partially-connected ``MCPTools`` is about to be
+    discarded. The contexts are anyio-tracked async generators, so we
+    have to exit them on the same task that entered them — which is the
+    caller's task, since ``_connect`` / ``_ensure_session`` both run
+    there.
+
+    Covers two paths:
+    1. ``_active_contexts`` — entries appended after a successful
+       ``__aenter__``. Drain in reverse so ``ClientSession`` exits
+       before ``stdio_client``.
+    2. ``_session_context`` / ``_context`` — the raw attribute slots
+       MCPTools uses while entering. If ``__aenter__`` raised mid-way,
+       one of these may be set without having made it into
+       ``_active_contexts``; exiting them here is a best-effort flush
+       so the underlying async generator doesn't leak to the GC.
+    """
+    if tools is None:
+        return
+    drained_ids: set[int] = set()
+    for ctx in reversed(list(getattr(tools, "_active_contexts", []))):
+        drained_ids.add(id(ctx))
+        try:
+            await ctx.__aexit__(None, None, None)
+        except BaseException:
+            pass
+    for attr in ("_session_context", "_context"):
+        ctx = getattr(tools, attr, None)
+        if ctx is None or id(ctx) in drained_ids:
+            continue
+        try:
+            await ctx.__aexit__(None, None, None)
+        except BaseException:
+            pass
 
 
 def _describe_tools(tools: MCPTools) -> list[tuple[str, str, str]]:

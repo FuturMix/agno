@@ -275,8 +275,11 @@ def test_mcp_id_auto_sanitized_from_server_name():
 def test_mcp_status_before_connect_reports_pending():
     p = MCPContextProvider("srv", transport="streamable-http", url="https://example.com/mcp")
     status = p.status()
-    # Not yet connected — sync status() must not force an async connect.
-    assert status.ok is True
+    # Not yet connected — sync status() must not force an async connect,
+    # and `ok` must be False because the provider can't serve queries
+    # in this state. A caller gating on status.ok should see "not ready"
+    # rather than a false green light.
+    assert status.ok is False
     assert "not yet connected" in status.detail
 
 
